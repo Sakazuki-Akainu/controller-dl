@@ -3,13 +3,20 @@ import logging
 import os
 import re
 import sys
+
+# --- FIX: FORCE EVENT LOOP FOR PYTHON 3.14+ ---
+# This must run BEFORE 'from pyrogram import Client'
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 from datetime import datetime, timedelta
 from pyrogram import Client, filters
 import motor.motor_asyncio
 from aiohttp import web
 
 # --- IMPORT YOUR ENGINE ---
-# Make sure you upload 'pahe_engine.py' to Render alongside this file!
 try:
     from pahe_engine import PaheEngine
 except ImportError:
@@ -20,9 +27,9 @@ except ImportError:
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 SESSION_STRING = os.getenv("SESSION_STRING", "")
-TARGET_GROUP = int(os.getenv("TARGET_GROUP", "0")) # The Group ID where bots talk
+TARGET_GROUP = int(os.getenv("TARGET_GROUP", "0")) 
 MONGO_URL = os.getenv("MONGO_URL", "")
-PORT = int(os.getenv("PORT", 8080)) # Render provides this automatically
+PORT = int(os.getenv("PORT", 8080)) 
 
 # --- SETUP ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -150,14 +157,12 @@ async def task_downloader():
             logger.info(f"▶️ [DL START] {title} Ep {ep}")
             dl_start_time = datetime.utcnow()
 
-            # --- UPDATED COMMAND FORMAT ---
-            # Old: /dl -a "Name" -e 1 -r all
             # New: /anime Name -e 1 -r all
             dl_cmd = f'/anime {title} -e {ep} -r all'
             
             await app.send_message(TARGET_GROUP, dl_cmd)
 
-            # Wait for Koyeb Bot to say "All done!" (or "Download successful")
+            # Wait for Koyeb Bot to say "All done"
             success = await wait_for_trigger(
                 trigger_text="All done", 
                 start_time=dl_start_time,
@@ -177,8 +182,7 @@ async def task_downloader():
 
 async def task_uploader():
     # Note: This task relies on your Koyeb bot uploading the file to the channel.
-    # If the Controller Bot needs to *forward* it somewhere else, that logic goes here.
-    # Currently, it just marks it as "uploading" then "done" if found.
+    # It just marks it as "uploading" then "done" if found.
     logger.info("⬆️ Uploader Worker Started (Tracking Only).")
     while True:
         item = await col_queue.find_one({"status": "downloaded"})
