@@ -3,14 +3,6 @@ import logging
 import os
 import re
 import sys
-
-# --- FIX: FORCE EVENT LOOP FOR PYTHON 3.14+ ---
-# This must run BEFORE 'from pyrogram import Client'
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
 from datetime import datetime, timedelta
 from pyrogram import Client, filters
 import motor.motor_asyncio
@@ -20,23 +12,23 @@ from aiohttp import web
 try:
     from pahe_engine import PaheEngine
 except ImportError:
-    print("❌ CRITICAL: 'pahe_engine.py' not found! The bot needs this file to scrape anime.")
+    print("❌ CRITICAL: 'pahe_engine.py' not found!")
     sys.exit(1)
 
-# --- CONFIGURATION (Load from Environment Variables) ---
+# --- CONFIGURATION ---
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 SESSION_STRING = os.getenv("SESSION_STRING", "")
-TARGET_GROUP = int(os.getenv("TARGET_GROUP", "0")) 
+TARGET_GROUP = int(os.getenv("TARGET_GROUP", "0"))
 MONGO_URL = os.getenv("MONGO_URL", "")
-PORT = int(os.getenv("PORT", 8080)) 
+PORT = int(os.getenv("PORT", 8080))
 
 # --- SETUP ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger("Controller")
 
 if not MONGO_URL or not SESSION_STRING:
-    logger.error("❌ Config Missing! Make sure MONGO_URL and SESSION_STRING are set in Render.")
+    logger.error("❌ Config Missing!")
     sys.exit(1)
 
 mongo = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
@@ -46,11 +38,9 @@ col_queue = db["queue"]
 app = Client("controller_user", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 engine = PaheEngine()
 
-# --- DUMMY WEB SERVER (Keep Render Alive) ---
+# --- DUMMY WEB SERVER ---
 async def web_server():
-    async def handle(request):
-        return web.Response(text="Controller Bot is Running!")
-
+    async def handle(request): return web.Response(text="Controller Bot is Running!")
     server = web.Application()
     server.router.add_get("/", handle)
     runner = web.AppRunner(server)
@@ -59,61 +49,76 @@ async def web_server():
     await site.start()
     logger.info(f"🌍 Web server started on port {PORT}")
 
-# --- HELPER: STRONG NORMALIZER ---
+# --- HELPER: NORMALIZER ---
 def normalize(text):
     if not text: return ""
     return re.sub(r'[^a-zA-Z0-9]', '', text).lower()
 
-# --- HELPER: WATCHER ---
-async def wait_for_trigger(trigger_text, start_time, timeout=3600, require_text_in_msg=None):
-    logger.info(f"👀 Watching for: '{trigger_text}' (Start Time: {start_time.strftime('%H:%M:%S')})")
+# --- HELPER: WATCHER (Detects Edited Messages) ---
+async def wait_for_trigger(trigger_text, start_time, timeout=7200):
+    logger.info(f"👀 Watching for: '{trigger_text}'...")
     loop_start = asyncio.get_event_loop().time()
     
     while True:
         if (asyncio.get_event_loop().time() - loop_start) > timeout:
             return False
 
-        found = False
         try:
-            # Check last 10 messages in the target group
-            async for msg in app.get_chat_history(TARGET_GROUP, limit=10):
+            # Check last 5 messages (Koyeb bot usually replies recently)
+            async for msg in app.get_chat_history(TARGET_GROUP, limit=5):
                 if not msg.text: continue
 
-                # 1. Check Trigger Word
+                # Check if the message contains our trigger
                 if trigger_text.lower() in msg.text.lower():
+                    # Check Timestamp (Creation OR Edit time)
+                    msg_time = msg.edit_date or msg.date
                     
-                    # 2. Check Timestamp (Allow slight 5s variance)
-                    msg_time = msg.edit_date or msg.date 
-                    if msg_time > (start_time - timedelta(seconds=5)):
-                        
-                        # 3. Check Required Text (Normalized)
-                        if require_text_in_msg:
-                            clean_req = normalize(require_text_in_msg)
-                            clean_msg = normalize(msg.text)
-                            
-                            if clean_req in clean_msg:
-                                logger.info(f"✅ MATCH FOUND: {msg.text[:50]}...")
-                                found = True
-                                break
-                        else:
-                            found = True
-                            break
+                    # If the message was created OR edited AFTER we started waiting
+                    if msg_time > (start_time - timedelta(seconds=10)):
+                        logger.info(f"✅ Trigger Found: {msg.text[:30]}...")
+                        return True
 
         except Exception as e:
-            logger.error(f"⚠️ Error reading history: {e}")
+            logger.error(f"⚠️ Watcher Error: {e}")
             await asyncio.sleep(5)
         
-        if found: return True
         await asyncio.sleep(10) # Check every 10 seconds
 
 # --- CACHE WARMER ---
 async def warm_up():
-    logger.info("🔥 Warming up cache...")
+    try: await app.get_chat(TARGET_GROUP)
+    except: logger.error("❌ Target Group NOT found!")
+
+# --- DATABASE COMMANDS ---
+@app.on_message(filters.command("queue"))
+async def queue_status(client, message):
     try:
-        await app.get_chat(TARGET_GROUP)
-        logger.info("✅ Resolved Target Group ID.")
-    except:
-        logger.error("❌ CRITICAL: Target Group NOT found! Make sure the user account has joined the group.")
+        # Get all pending items, sorted by time
+        cursor = col_queue.find({"status": "pending"}).sort("found_at", 1)
+        items = await cursor.to_list(length=20) # Limit to 20 to avoid spam
+        
+        if not items:
+            await message.reply("✅ **Queue is empty!** No pending anime.")
+            return
+
+        text = "📋 **Pending Anime Queue:**\n\n"
+        for i, item in enumerate(items, 1):
+            text += f"**{i}.** {item['title']} - Ep {item['ep']} `[Pending]`\n"
+        
+        total = await col_queue.count_documents({"status": "pending"})
+        if total > 20:
+            text += f"\n...and {total - 20} more."
+
+        await message.reply(text)
+    except Exception as e:
+        await message.reply(f"❌ Error fetching queue: {e}")
+
+@app.on_message(filters.command("retry_all"))
+async def retry_stuck(client, message):
+    try:
+        r = await col_queue.update_many({"status": "downloading"}, {"$set": {"status": "pending"}})
+        await message.reply(f"🔄 Reset {r.modified_count} stuck items to Pending.")
+    except: pass
 
 # --- TASKS ---
 
@@ -125,7 +130,6 @@ async def task_poller():
             if releases:
                 for item in releases:
                     session = item["session"]
-                    # If not exists in DB, add it
                     if not await col_queue.find_one({"_id": session}):
                         entry = {
                             "_id": session,
@@ -139,71 +143,76 @@ async def task_poller():
                         logger.info(f"🆕 Queued: {item['title']} - Ep {item['ep']}")
         except Exception as e:
             logger.error(f"Polling Error: {e}")
-        await asyncio.sleep(600) # Check every 10 minutes
+        await asyncio.sleep(600)
 
 async def task_downloader():
     logger.info("⬇️ Downloader Worker Started.")
     while True:
+        # 1. Get the next pending item
         item = await col_queue.find_one({"status": "pending"})
         if not item:
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
             continue
             
         title = item["title"]
         ep = item["ep"]
         
         try:
+            # 2. Mark as downloading so we don't pick it again immediately
             await col_queue.update_one({"_id": item["_id"]}, {"$set": {"status": "downloading"}})
-            logger.info(f"▶️ [DL START] {title} Ep {ep}")
-            dl_start_time = datetime.utcnow()
-
-            # New: /anime Name -e 1 -r all
-            dl_cmd = f'/anime {title} -e {ep} -r all'
+            logger.info(f"▶️ [START] Processing: {title} Ep {ep}")
             
-            await app.send_message(TARGET_GROUP, dl_cmd)
+            start_time = datetime.utcnow()
 
-            # Wait for Koyeb Bot to say "All done"
+            # 3. Send Command
+            dl_cmd = f'/anime {title} -e {ep} -r all'
+            sent_msg = await app.send_message(TARGET_GROUP, dl_cmd)
+            
+            logger.info(f"⏳ Waiting for 'All done!' trigger...")
+
+            # 4. Wait for the Koyeb Bot to finish (it edits message to "✅ All done!")
             success = await wait_for_trigger(
                 trigger_text="All done", 
-                start_time=dl_start_time,
-                timeout=7200 # 2 hours timeout
+                start_time=start_time,
+                timeout=7200 # 2 Hour timeout in case of big files
             )
 
             if success:
-                logger.info(f"✅ [DL FINISH] {title}")
+                logger.info(f"✅ [FINISH] {title} completed successfully.")
                 await col_queue.update_one({"_id": item["_id"]}, {"$set": {"status": "downloaded"}})
+                
+                # --- THE COOL DOWN ---
+                # This is crucial for your Koyeb server health
+                logger.info("❄️ Resting for 30 minutes before next task...")
+                await app.send_message(TARGET_GROUP, f"💤 Cooling down for 30 mins after **{title}**...")
+                await asyncio.sleep(1800) # 30 Minutes Sleep
+                
             else:
-                logger.warning(f"❌ [DL FAILED] Timeout: {title}")
+                logger.warning(f"❌ [TIMEOUT] {title} took too long.")
+                # Reset to pending to try again later? Or mark failed?
+                # Marking failed for now to prevent infinite loops.
                 await col_queue.update_one({"_id": item["_id"]}, {"$set": {"status": "failed_dl"}})
 
         except Exception as e:
             logger.error(f"Downloader Error: {e}")
-            await asyncio.sleep(30)
+            # If error, wait 1 min then retry loop
+            await asyncio.sleep(60)
 
 async def task_uploader():
-    # Note: This task relies on your Koyeb bot uploading the file to the channel.
-    # It just marks it as "uploading" then "done" if found.
-    logger.info("⬆️ Uploader Worker Started (Tracking Only).")
+    # Only marks items as "done" since Koyeb handles the actual upload
+    logger.info("⬆️ Uploader Monitor Started.")
     while True:
         item = await col_queue.find_one({"status": "downloaded"})
         if not item:
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
             continue
-
-        try:
-            # Since the Koyeb bot handles the upload automatically now,
-            # we just mark it as done in our DB to keep things clean.
-            logger.info(f"✅ [UP FINISH] {item['title']} (Handled by Koyeb)")
-            await col_queue.update_one({"_id": item["_id"]}, {"$set": {"status": "done"}})
-            
-        except Exception as e:
-            logger.error(f"Uploader Error: {e}")
-            await asyncio.sleep(30)
+        # Just clean up DB status
+        await col_queue.update_one({"_id": item["_id"]}, {"$set": {"status": "done"}})
+        await asyncio.sleep(1)
 
 async def main():
     await app.start()
     await warm_up()
-    # Run Web Server and Tasks concurrently
     await asyncio.gather(web_server(), task_poller(), task_downloader(), task_uploader())
 
 if __name__ == "__main__":
