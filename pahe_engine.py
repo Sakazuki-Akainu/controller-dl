@@ -51,7 +51,7 @@ class PaheEngine:
                     "title": item.get('anime_title'),
                     "ep": ep,
                     "time": time_str,
-                    "session": item.get('session') # <--- FIXED: Added this back
+                    "session": item.get('session')
                 })
             
             return results
