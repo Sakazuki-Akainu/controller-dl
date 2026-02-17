@@ -30,7 +30,6 @@ TARGET_GROUP = int(os.getenv("TARGET_GROUP", "0"))
 MONGO_URL = os.getenv("MONGO_URL", "")
 PORT = int(os.getenv("PORT", 8080))
 
-# Admin List (Environment Variable: ADMIN_IDS="12345, 67890")
 def get_env_list(var_name):
     val = os.getenv(var_name)
     if val:
@@ -66,9 +65,13 @@ async def web_server():
     logger.info(f"🌍 Web server started on port {PORT}")
 
 # --- HELPERS ---
-def normalize(text):
+
+def normalize_for_cmd(text):
+    """Cleans title for safe shell execution (Removes ' " ! ?)"""
     if not text: return ""
-    return re.sub(r'[^a-zA-Z0-9]', '', text).lower()
+    # Remove single quotes, double quotes, exclamation marks, etc.
+    clean = re.sub(r"['\"!?;:]", "", text)
+    return clean.strip()
 
 async def is_admin(message):
     if not ADMIN_IDS: return True
@@ -87,7 +90,9 @@ async def wait_for_trigger(trigger_text, start_time, timeout=7200):
         try:
             async for msg in app.get_chat_history(TARGET_GROUP, limit=5):
                 if not msg.text: continue
+                # Check for trigger
                 if trigger_text.lower() in msg.text.lower():
+                    # Check timestamp (Edit or Create)
                     msg_time = msg.edit_date or msg.date
                     if msg_time > (start_time - timedelta(seconds=10)):
                         logger.info(f"✅ Trigger Found: {msg.text[:30]}...")
@@ -112,15 +117,11 @@ async def start(client, message):
 @app.on_message(filters.command("list"))
 async def list_releases(client, message):
     if not await is_admin(message): return
-    
-    status = await message.reply("🔍 Fetching latest releases from AnimePahe...")
-    
+    status = await message.reply("🔍 Fetching releases...")
     try:
-        # Run synchronous engine code in a thread to avoid blocking
         releases = await asyncio.to_thread(engine.get_latest_releases)
-        
         if not releases:
-            await status.edit_text("❌ Failed to fetch releases or site is empty.")
+            await status.edit_text("❌ Failed to fetch releases.")
             return
 
         text = "📅 **Latest Anime Releases (Page 1):**\n\n"
@@ -128,7 +129,6 @@ async def list_releases(client, message):
             text += f"**{i}.** `{item['title']}` - Ep {item['ep']} ({item['time']})\n"
         
         await status.edit_text(text)
-        
     except Exception as e:
         logger.error(f"List Error: {e}")
         await status.edit_text(f"❌ Error: {e}")
@@ -141,26 +141,26 @@ async def queue_status(client, message):
         items = await cursor.to_list(length=20)
         
         if not items:
-            await message.reply("✅ **Queue is empty!** No pending anime.")
+            await message.reply("✅ **Queue is empty!**")
             return
 
-        text = "📋 **Pending Anime Queue:**\n\n"
+        text = "📋 **Pending Queue:**\n\n"
         for i, item in enumerate(items, 1):
-            text += f"**{i}.** {item['title']} - Ep {item['ep']} `[Pending]`\n"
+            text += f"**{i}.** {item['title']} - Ep {item['ep']}\n"
         
         total = await col_queue.count_documents({"status": "pending"})
         if total > 20: text += f"\n...and {total - 20} more."
 
         await message.reply(text)
     except Exception as e:
-        await message.reply(f"❌ Error fetching queue: {e}")
+        await message.reply(f"❌ Error: {e}")
 
 @app.on_message(filters.command("retry_all"))
 async def retry_stuck(client, message):
     if not await is_admin(message): return
     try:
         r = await col_queue.update_many({"status": "downloading"}, {"$set": {"status": "pending"}})
-        await message.reply(f"🔄 Reset {r.modified_count} stuck items to Pending.")
+        await message.reply(f"🔄 Reset {r.modified_count} items to Pending.")
     except: pass
 
 @app.on_message(filters.command("restart"))
@@ -202,30 +202,35 @@ async def task_downloader():
             await asyncio.sleep(10)
             continue
             
-        title = item["title"]
+        # Get raw title from DB
+        raw_title = item["title"]
         ep = item["ep"]
+        
+        # --- CLEAN TITLE FOR SHELL COMMAND ---
+        safe_title = normalize_for_cmd(raw_title)
         
         try:
             await col_queue.update_one({"_id": item["_id"]}, {"$set": {"status": "downloading"}})
-            logger.info(f"▶️ [START] Processing: {title} Ep {ep}")
+            logger.info(f"▶️ [START] Processing: {safe_title} Ep {ep}")
             
             start_time = datetime.utcnow()
-            dl_cmd = f'/anime {title} -e {ep} -r all'
+            
+            # Send CLEANED title to Koyeb bot
+            dl_cmd = f'/anime {safe_title} -e {ep} -r all'
             await app.send_message(TARGET_GROUP, dl_cmd)
             
-            logger.info(f"⏳ Waiting for 'All done!' trigger...")
+            logger.info(f"⏳ Waiting for 'All done!'...")
             success = await wait_for_trigger("All done", start_time, timeout=7200)
 
             if success:
-                logger.info(f"✅ [FINISH] {title} completed.")
+                logger.info(f"✅ [FINISH] {safe_title} completed.")
                 await col_queue.update_one({"_id": item["_id"]}, {"$set": {"status": "downloaded"}})
                 
                 logger.info("❄️ Resting for 30 minutes...")
-                await app.send_message(TARGET_GROUP, f"💤 Cooling down for 30 mins after **{title}**...")
+                await app.send_message(TARGET_GROUP, f"💤 Cooling down 30m after **{safe_title}**...")
                 await asyncio.sleep(1800) 
-                
             else:
-                logger.warning(f"❌ [TIMEOUT] {title} took too long.")
+                logger.warning(f"❌ [TIMEOUT] {safe_title}")
                 await col_queue.update_one({"_id": item["_id"]}, {"$set": {"status": "failed_dl"}})
 
         except Exception as e:
@@ -233,7 +238,7 @@ async def task_downloader():
             await asyncio.sleep(60)
 
 async def task_uploader():
-    logger.info("⬆️ Uploader Monitor Started.")
+    # Only marks as done (Koyeb handles actual upload)
     while True:
         item = await col_queue.find_one({"status": "downloaded"})
         if not item:
