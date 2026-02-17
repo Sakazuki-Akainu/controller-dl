@@ -15,7 +15,7 @@ try:
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
-# --- IMPORT YOUR ENGINE ---
+# --- IMPORT ENGINE ---
 try:
     from pahe_engine import PaheEngine
 except ImportError:
@@ -78,10 +78,6 @@ async def is_admin(message):
     return True
 
 async def wait_for_result(start_time, timeout=7200):
-    """
-    Watches chat for specific bot responses.
-    Returns: 'success', 'failed', or 'timeout'
-    """
     logger.info(f"👀 Watching for completion triggers...")
     loop_start = asyncio.get_event_loop().time()
     
@@ -90,24 +86,19 @@ async def wait_for_result(start_time, timeout=7200):
             return "timeout"
 
         try:
-            # Check last 5 messages
             async for msg in app.get_chat_history(TARGET_GROUP, limit=5):
                 if not msg.text: continue
                 
-                # Check Timestamp (Must be after we sent the command)
                 msg_time = msg.edit_date or msg.date
                 if msg_time < (start_time - timedelta(seconds=10)):
                     continue
 
                 text = msg.text.lower()
 
-                # 1. SUCCESS TRIGGER
                 if "all done" in text and "successful" in text:
                     logger.info(f"✅ Detect: Success")
                     return "success"
                 
-                # 2. PARTIAL/FULL FAILURE TRIGGER
-                # Matches: "Job finished. 2/3 successful" OR "Task finished, but errors occurred"
                 if "job finished" in text or "task finished" in text or "failed to download" in text:
                     logger.info(f"❌ Detect: Failure/Partial")
                     return "failed"
@@ -118,9 +109,30 @@ async def wait_for_result(start_time, timeout=7200):
         
         await asyncio.sleep(10)
 
+# --- ROBUST WARM UP (THE FIX) ---
 async def warm_up():
-    try: await app.get_chat(TARGET_GROUP)
-    except: logger.error("❌ Target Group NOT found!")
+    logger.info("🔥 Warming up cache to resolve Peer ID...")
+    
+    # Method 1: Try direct access (Fastest)
+    try:
+        await app.get_chat(TARGET_GROUP)
+        logger.info("✅ Target Group resolved instantly.")
+        return
+    except:
+        logger.warning("⚠️ Direct resolution failed. Scanning dialogs...")
+
+    # Method 2: Scan dialogs to find the group (Self-Healing)
+    try:
+        async for dialog in app.get_dialogs():
+            if dialog.chat.id == TARGET_GROUP:
+                logger.info(f"✅ Found Group in Dialogs: {dialog.chat.title}")
+                # Force a refresh now that we found it
+                await app.get_chat(TARGET_GROUP)
+                return
+    except Exception as e:
+        logger.error(f"❌ Dialog scan error: {e}")
+
+    logger.error(f"❌ CRITICAL: Could not find Group {TARGET_GROUP}. Make sure the account joined it!")
 
 # --- COMMANDS ---
 
@@ -152,13 +164,12 @@ async def list_releases(client, message):
 async def queue_status(client, message):
     if not await is_admin(message): return
     try:
-        # Show both PENDING and FAILED (waiting retry) items
         query = {"status": {"$in": ["pending", "failed_dl"]}}
         cursor = col_queue.find(query).sort("found_at", 1)
         items = await cursor.to_list(length=30)
         
         if not items:
-            await message.reply("✅ **Queue is empty!** No pending or retrying anime.")
+            await message.reply("✅ **Queue is empty!**")
             return
 
         text = "📋 **Anime Queue Status:**\n\n"
@@ -180,12 +191,11 @@ async def queue_status(client, message):
 async def retry_stuck(client, message):
     if not await is_admin(message): return
     try:
-        # Reset everything relevant to pending
         r = await col_queue.update_many(
             {"status": {"$in": ["downloading", "failed_dl"]}}, 
             {"$set": {"status": "pending"}}
         )
-        await message.reply(f"🔄 Reset {r.modified_count} items to Pending state.")
+        await message.reply(f"🔄 Reset {r.modified_count} items to Pending.")
     except: pass
 
 @app.on_message(filters.command("restart"))
@@ -212,7 +222,7 @@ async def task_poller():
                             "time": item["time"],
                             "found_at": datetime.utcnow(),
                             "status": "pending",
-                            "retry_count": 0  # Initialize retry count
+                            "retry_count": 0
                         }
                         await col_queue.insert_one(entry)
                         logger.info(f"🆕 Queued: {item['title']} - Ep {item['ep']}")
@@ -223,7 +233,6 @@ async def task_poller():
 async def task_downloader():
     logger.info("⬇️ Downloader Worker Started.")
     while True:
-        # Prioritize PENDING, then FAILED_DL (Retries)
         item = await col_queue.find_one({"status": {"$in": ["pending", "failed_dl"]}}, sort=[("found_at", 1)])
         
         if not item:
@@ -234,7 +243,6 @@ async def task_downloader():
         ep = item["ep"]
         retries = item.get("retry_count", 0)
 
-        # Safety Check: Too many retries?
         if retries >= 3:
             logger.warning(f"💀 Skipping {title} (Too many failures)")
             await col_queue.update_one({"_id": item["_id"]}, {"$set": {"status": "dead"}})
@@ -243,39 +251,33 @@ async def task_downloader():
         try:
             await col_queue.update_one({"_id": item["_id"]}, {"$set": {"status": "downloading"}})
             
-            # Sanitize Title
             safe_title = normalize_for_cmd(title)
             
             logger.info(f"▶️ [START] Processing: {safe_title} Ep {ep} (Try {retries+1})")
             start_time = datetime.utcnow()
             
-            # Send Command
             dl_cmd = f'/anime {safe_title} -e {ep} -r all'
             await app.send_message(TARGET_GROUP, dl_cmd)
             
-            # Wait for Result
             result = await wait_for_result(start_time, timeout=7200)
 
             if result == "success":
                 logger.info(f"✅ [FINISH] {title} completed.")
                 await col_queue.update_one({"_id": item["_id"]}, {"$set": {"status": "downloaded"}})
-                
-                # --- COOL DOWN ---
                 logger.info("❄️ Success. Cooling down for 30 minutes...")
                 await app.send_message(TARGET_GROUP, f"💤 Success! Cooling down 30m after **{safe_title}**...")
                 await asyncio.sleep(1800) 
 
             elif result == "failed":
                 logger.warning(f"❌ [FAILED] {title} failed or partial.")
-                # Mark as pending again to retry, increment counter
                 await col_queue.update_one(
                     {"_id": item["_id"]}, 
                     {"$set": {"status": "pending"}, "$inc": {"retry_count": 1}}
                 )
                 logger.info("❄️ Failure detected. Resting 5 mins before retry...")
-                await asyncio.sleep(300) # Short rest on failure
+                await asyncio.sleep(300)
 
-            else: # Timeout
+            else: 
                 logger.warning(f"❌ [TIMEOUT] {title} timed out.")
                 await col_queue.update_one(
                     {"_id": item["_id"]}, 
@@ -288,7 +290,6 @@ async def task_downloader():
             await asyncio.sleep(60)
 
 async def task_uploader():
-    # Just a cleaner to mark uploaded items as done
     logger.info("⬆️ Uploader Monitor Started.")
     while True:
         item = await col_queue.find_one({"status": "downloaded"})
