@@ -67,9 +67,7 @@ async def web_server():
 # --- HELPERS ---
 
 def normalize_for_cmd(text):
-    """Cleans title for safe shell execution (Removes ' " ! ?)"""
     if not text: return ""
-    # Remove single quotes, double quotes, exclamation marks, etc.
     clean = re.sub(r"['\"!?;:]", "", text)
     return clean.strip()
 
@@ -79,24 +77,41 @@ async def is_admin(message):
         return False
     return True
 
-async def wait_for_trigger(trigger_text, start_time, timeout=7200):
-    logger.info(f"👀 Watching for: '{trigger_text}'...")
+async def wait_for_result(start_time, timeout=7200):
+    """
+    Watches chat for specific bot responses.
+    Returns: 'success', 'failed', or 'timeout'
+    """
+    logger.info(f"👀 Watching for completion triggers...")
     loop_start = asyncio.get_event_loop().time()
     
     while True:
         if (asyncio.get_event_loop().time() - loop_start) > timeout:
-            return False
+            return "timeout"
 
         try:
+            # Check last 5 messages
             async for msg in app.get_chat_history(TARGET_GROUP, limit=5):
                 if not msg.text: continue
-                # Check for trigger
-                if trigger_text.lower() in msg.text.lower():
-                    # Check timestamp (Edit or Create)
-                    msg_time = msg.edit_date or msg.date
-                    if msg_time > (start_time - timedelta(seconds=10)):
-                        logger.info(f"✅ Trigger Found: {msg.text[:30]}...")
-                        return True
+                
+                # Check Timestamp (Must be after we sent the command)
+                msg_time = msg.edit_date or msg.date
+                if msg_time < (start_time - timedelta(seconds=10)):
+                    continue
+
+                text = msg.text.lower()
+
+                # 1. SUCCESS TRIGGER
+                if "all done" in text and "successful" in text:
+                    logger.info(f"✅ Detect: Success")
+                    return "success"
+                
+                # 2. PARTIAL/FULL FAILURE TRIGGER
+                # Matches: "Job finished. 2/3 successful" OR "Task finished, but errors occurred"
+                if "job finished" in text or "task finished" in text or "failed to download" in text:
+                    logger.info(f"❌ Detect: Failure/Partial")
+                    return "failed"
+
         except Exception as e:
             logger.error(f"⚠️ Watcher Error: {e}")
             await asyncio.sleep(5)
@@ -112,7 +127,7 @@ async def warm_up():
 @app.on_message(filters.command("start"))
 async def start(client, message):
     if not await is_admin(message): return
-    await message.reply("👋 Controller is Online!\n\n/list - See latest anime\n/queue - See pending jobs\n/retry_all - Reset stuck jobs")
+    await message.reply("👋 Controller is Online!\n\n/list - Latest releases\n/queue - View status\n/retry_all - Unstick downloads")
 
 @app.on_message(filters.command("list"))
 async def list_releases(client, message):
@@ -137,19 +152,25 @@ async def list_releases(client, message):
 async def queue_status(client, message):
     if not await is_admin(message): return
     try:
-        cursor = col_queue.find({"status": "pending"}).sort("found_at", 1)
-        items = await cursor.to_list(length=20)
+        # Show both PENDING and FAILED (waiting retry) items
+        query = {"status": {"$in": ["pending", "failed_dl"]}}
+        cursor = col_queue.find(query).sort("found_at", 1)
+        items = await cursor.to_list(length=30)
         
         if not items:
-            await message.reply("✅ **Queue is empty!**")
+            await message.reply("✅ **Queue is empty!** No pending or retrying anime.")
             return
 
-        text = "📋 **Pending Queue:**\n\n"
+        text = "📋 **Anime Queue Status:**\n\n"
         for i, item in enumerate(items, 1):
-            text += f"**{i}.** {item['title']} - Ep {item['ep']}\n"
+            status_icon = "⏳" if item['status'] == "pending" else "⚠️ Retry"
+            retries = item.get('retry_count', 0)
+            retry_text = f"(Try {retries})" if retries > 0 else ""
+            
+            text += f"**{i}.** {item['title']} - Ep {item['ep']} `{status_icon} {retry_text}`\n"
         
-        total = await col_queue.count_documents({"status": "pending"})
-        if total > 20: text += f"\n...and {total - 20} more."
+        total = await col_queue.count_documents(query)
+        if total > 30: text += f"\n...and {total - 30} more."
 
         await message.reply(text)
     except Exception as e:
@@ -159,8 +180,12 @@ async def queue_status(client, message):
 async def retry_stuck(client, message):
     if not await is_admin(message): return
     try:
-        r = await col_queue.update_many({"status": "downloading"}, {"$set": {"status": "pending"}})
-        await message.reply(f"🔄 Reset {r.modified_count} items to Pending.")
+        # Reset everything relevant to pending
+        r = await col_queue.update_many(
+            {"status": {"$in": ["downloading", "failed_dl"]}}, 
+            {"$set": {"status": "pending"}}
+        )
+        await message.reply(f"🔄 Reset {r.modified_count} items to Pending state.")
     except: pass
 
 @app.on_message(filters.command("restart"))
@@ -186,7 +211,8 @@ async def task_poller():
                             "ep": item["ep"],
                             "time": item["time"],
                             "found_at": datetime.utcnow(),
-                            "status": "pending"
+                            "status": "pending",
+                            "retry_count": 0  # Initialize retry count
                         }
                         await col_queue.insert_one(entry)
                         logger.info(f"🆕 Queued: {item['title']} - Ep {item['ep']}")
@@ -197,48 +223,73 @@ async def task_poller():
 async def task_downloader():
     logger.info("⬇️ Downloader Worker Started.")
     while True:
-        item = await col_queue.find_one({"status": "pending"})
+        # Prioritize PENDING, then FAILED_DL (Retries)
+        item = await col_queue.find_one({"status": {"$in": ["pending", "failed_dl"]}}, sort=[("found_at", 1)])
+        
         if not item:
             await asyncio.sleep(10)
             continue
             
-        # Get raw title from DB
-        raw_title = item["title"]
+        title = item["title"]
         ep = item["ep"]
-        
-        # --- CLEAN TITLE FOR SHELL COMMAND ---
-        safe_title = normalize_for_cmd(raw_title)
+        retries = item.get("retry_count", 0)
+
+        # Safety Check: Too many retries?
+        if retries >= 3:
+            logger.warning(f"💀 Skipping {title} (Too many failures)")
+            await col_queue.update_one({"_id": item["_id"]}, {"$set": {"status": "dead"}})
+            continue
         
         try:
             await col_queue.update_one({"_id": item["_id"]}, {"$set": {"status": "downloading"}})
-            logger.info(f"▶️ [START] Processing: {safe_title} Ep {ep}")
             
+            # Sanitize Title
+            safe_title = normalize_for_cmd(title)
+            
+            logger.info(f"▶️ [START] Processing: {safe_title} Ep {ep} (Try {retries+1})")
             start_time = datetime.utcnow()
             
-            # Send CLEANED title to Koyeb bot
+            # Send Command
             dl_cmd = f'/anime {safe_title} -e {ep} -r all'
             await app.send_message(TARGET_GROUP, dl_cmd)
             
-            logger.info(f"⏳ Waiting for 'All done!'...")
-            success = await wait_for_trigger("All done", start_time, timeout=7200)
+            # Wait for Result
+            result = await wait_for_result(start_time, timeout=7200)
 
-            if success:
-                logger.info(f"✅ [FINISH] {safe_title} completed.")
+            if result == "success":
+                logger.info(f"✅ [FINISH] {title} completed.")
                 await col_queue.update_one({"_id": item["_id"]}, {"$set": {"status": "downloaded"}})
                 
-                logger.info("❄️ Resting for 30 minutes...")
-                await app.send_message(TARGET_GROUP, f"💤 Cooling down 30m after **{safe_title}**...")
+                # --- COOL DOWN ---
+                logger.info("❄️ Success. Cooling down for 30 minutes...")
+                await app.send_message(TARGET_GROUP, f"💤 Success! Cooling down 30m after **{safe_title}**...")
                 await asyncio.sleep(1800) 
-            else:
-                logger.warning(f"❌ [TIMEOUT] {safe_title}")
-                await col_queue.update_one({"_id": item["_id"]}, {"$set": {"status": "failed_dl"}})
+
+            elif result == "failed":
+                logger.warning(f"❌ [FAILED] {title} failed or partial.")
+                # Mark as pending again to retry, increment counter
+                await col_queue.update_one(
+                    {"_id": item["_id"]}, 
+                    {"$set": {"status": "pending"}, "$inc": {"retry_count": 1}}
+                )
+                logger.info("❄️ Failure detected. Resting 5 mins before retry...")
+                await asyncio.sleep(300) # Short rest on failure
+
+            else: # Timeout
+                logger.warning(f"❌ [TIMEOUT] {title} timed out.")
+                await col_queue.update_one(
+                    {"_id": item["_id"]}, 
+                    {"$set": {"status": "pending"}, "$inc": {"retry_count": 1}}
+                )
+                await asyncio.sleep(300)
 
         except Exception as e:
             logger.error(f"Downloader Error: {e}")
             await asyncio.sleep(60)
 
 async def task_uploader():
-    # Only marks as done (Koyeb handles actual upload)
+    # Just a cleaner to mark uploaded items as done
+    logger.info("⬆️ Uploader Monitor Started.")
     while True:
         item = await col_queue.find_one({"status": "downloaded"})
         if not item:
