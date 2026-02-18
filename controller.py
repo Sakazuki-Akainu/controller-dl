@@ -77,16 +77,22 @@ async def is_admin(message):
         return False
     return True
 
-async def wait_for_result(start_time, timeout=7200):
-    logger.info(f"👀 Watching for completion triggers...")
+async def wait_for_result(start_time, target_title, target_ep, timeout=7200):
+    logger.info(f"👀 Watching for: '{target_title} - Ep {target_ep} Uploaded!'")
     loop_start = asyncio.get_event_loop().time()
     
+    # Pre-compute the expected success string (lowercase for checking)
+    expected_success = f"{target_title} - Ep {target_ep} Uploaded!".lower()
+    # Also clean the title in case the bot used the "safe" title in the response
+    safe_title = normalize_for_cmd(target_title)
+    expected_safe_success = f"{safe_title} - Ep {target_ep} Uploaded!".lower()
+
     while True:
         if (asyncio.get_event_loop().time() - loop_start) > timeout:
             return "timeout"
 
         try:
-            # Check last 20 messages (Increased range to ignore spam from other bots)
+            # Check last 20 messages
             async for msg in app.get_chat_history(TARGET_GROUP, limit=20):
                 if not msg.text: continue
                 
@@ -96,19 +102,16 @@ async def wait_for_result(start_time, timeout=7200):
 
                 text = msg.text.lower()
 
-                # 1. SUCCESS TRIGGER
-                if "all done" in text:
-                    logger.info(f"✅ Detect: Success")
+                # 1. SPECIFIC SUCCESS TRIGGER
+                # Looks for "Fire Force - Ep 2 Uploaded!"
+                if (expected_success in text) or (expected_safe_success in text):
+                    logger.info(f"✅ Detect: Success for {target_title}")
                     return "success"
                 
-                # 2. PARTIAL FAILURE TRIGGER (Still counts as 'done' for queue purposes)
-                if "job finished" in text or "successful" in text:
-                    logger.info(f"⚠️ Detect: Partial Success")
-                    return "success" # Treat partials as success to stop retrying loops
-
-                # 3. CRITICAL FAILURE TRIGGER
-                if "task finished" in text or "failed to download" in text:
-                    logger.info(f"❌ Detect: Failure")
+                # 2. CRITICAL FAILURE TRIGGER (If bot crashed or errored out specifically)
+                if "task finished" in text and "errors occurred" in text:
+                    # Only count as failure if it's the latest message from our bot
+                    logger.info(f"❌ Detect: Explicit Failure")
                     return "failed"
 
         except Exception as e:
@@ -155,7 +158,6 @@ async def list_releases(client, message):
 async def queue_status(client, message):
     if not await is_admin(message): return
     try:
-        # Show PENDING (Priority) first, then FAILED (Waiting manual retry)
         pending_count = await col_queue.count_documents({"status": "pending"})
         failed_count = await col_queue.count_documents({"status": "failed_dl"})
         
@@ -183,7 +185,6 @@ async def queue_status(client, message):
 async def retry_stuck(client, message):
     if not await is_admin(message): return
     try:
-        # Resets FAILED items to PENDING so they get picked up
         r = await col_queue.update_many(
             {"status": "failed_dl"}, 
             {"$set": {"status": "pending"}}
@@ -195,7 +196,6 @@ async def retry_stuck(client, message):
 async def clear_queue(client, message):
     if not await is_admin(message): return
     try:
-        # Deletes ALL pending or failed items
         r = await col_queue.delete_many({"status": {"$in": ["pending", "failed_dl"]}})
         await message.reply(f"🗑️ Deleted {r.deleted_count} items from queue.")
     except: pass
@@ -216,7 +216,6 @@ async def task_poller():
             if releases:
                 for item in releases:
                     session = item["session"]
-                    # If not exists in DB, add it
                     if not await col_queue.find_one({"_id": session}):
                         entry = {
                             "_id": session,
@@ -224,7 +223,8 @@ async def task_poller():
                             "ep": item["ep"],
                             "time": item["time"],
                             "found_at": datetime.utcnow(),
-                            "status": "pending" # New items are always PENDING
+                            "status": "pending",
+                            "retry_count": 0
                         }
                         await col_queue.insert_one(entry)
                         logger.info(f"🆕 Queued: {item['title']} - Ep {item['ep']}")
@@ -235,8 +235,6 @@ async def task_poller():
 async def task_downloader():
     logger.info("⬇️ Downloader Worker Started.")
     while True:
-        # 1. PRIORITY: Pick "pending" items (Fresh releases or manually retried)
-        # We ignore "failed_dl" items until user types /retry_all
         item = await col_queue.find_one({"status": "pending"}, sort=[("found_at", 1)])
         
         if not item:
@@ -257,7 +255,8 @@ async def task_downloader():
             dl_cmd = f'/anime {safe_title} -e {ep} -r all'
             await app.send_message(TARGET_GROUP, dl_cmd)
             
-            result = await wait_for_result(start_time, timeout=7200)
+            # Pass title/ep to waiter so it matches SPECIFIC message
+            result = await wait_for_result(start_time, safe_title, ep, timeout=7200)
 
             if result == "success":
                 logger.info(f"✅ [FINISH] {title} completed.")
@@ -268,13 +267,8 @@ async def task_downloader():
                 await asyncio.sleep(1800) 
 
             else: 
-                # FAILED or TIMEOUT
                 logger.warning(f"❌ [FAILED] {title}")
-                # Mark as 'failed_dl' and DO NOT RETRY automatically.
-                # User must use /retry_all to try again.
                 await col_queue.update_one({"_id": item["_id"]}, {"$set": {"status": "failed_dl"}})
-                
-                # Short cool down on failure to protect server
                 await asyncio.sleep(120)
 
         except Exception as e:
