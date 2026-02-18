@@ -86,7 +86,8 @@ async def wait_for_result(start_time, timeout=7200):
             return "timeout"
 
         try:
-            async for msg in app.get_chat_history(TARGET_GROUP, limit=5):
+            # Check last 20 messages (Increased range to ignore spam from other bots)
+            async for msg in app.get_chat_history(TARGET_GROUP, limit=20):
                 if not msg.text: continue
                 
                 msg_time = msg.edit_date or msg.date
@@ -95,12 +96,19 @@ async def wait_for_result(start_time, timeout=7200):
 
                 text = msg.text.lower()
 
-                if "all done" in text and "successful" in text:
+                # 1. SUCCESS TRIGGER
+                if "all done" in text:
                     logger.info(f"✅ Detect: Success")
                     return "success"
                 
-                if "job finished" in text or "task finished" in text or "failed to download" in text:
-                    logger.info(f"❌ Detect: Failure/Partial")
+                # 2. PARTIAL FAILURE TRIGGER (Still counts as 'done' for queue purposes)
+                if "job finished" in text or "successful" in text:
+                    logger.info(f"⚠️ Detect: Partial Success")
+                    return "success" # Treat partials as success to stop retrying loops
+
+                # 3. CRITICAL FAILURE TRIGGER
+                if "task finished" in text or "failed to download" in text:
+                    logger.info(f"❌ Detect: Failure")
                     return "failed"
 
         except Exception as e:
@@ -109,37 +117,20 @@ async def wait_for_result(start_time, timeout=7200):
         
         await asyncio.sleep(10)
 
-# --- ROBUST WARM UP (THE FIX) ---
 async def warm_up():
-    logger.info("🔥 Warming up cache to resolve Peer ID...")
-    
-    # Method 1: Try direct access (Fastest)
+    logger.info("🔥 Checking Target Group access...")
     try:
-        await app.get_chat(TARGET_GROUP)
-        logger.info("✅ Target Group resolved instantly.")
-        return
-    except:
-        logger.warning("⚠️ Direct resolution failed. Scanning dialogs...")
-
-    # Method 2: Scan dialogs to find the group (Self-Healing)
-    try:
-        async for dialog in app.get_dialogs():
-            if dialog.chat.id == TARGET_GROUP:
-                logger.info(f"✅ Found Group in Dialogs: {dialog.chat.title}")
-                # Force a refresh now that we found it
-                await app.get_chat(TARGET_GROUP)
-                return
+        chat = await app.get_chat(TARGET_GROUP)
+        logger.info(f"✅ Target Group Found: {chat.title}")
     except Exception as e:
-        logger.error(f"❌ Dialog scan error: {e}")
-
-    logger.error(f"❌ CRITICAL: Could not find Group {TARGET_GROUP}. Make sure the account joined it!")
+        logger.warning(f"⚠️ Target Group not cached yet. ({e})")
 
 # --- COMMANDS ---
 
 @app.on_message(filters.command("start"))
 async def start(client, message):
     if not await is_admin(message): return
-    await message.reply("👋 Controller is Online!\n\n/list - Latest releases\n/queue - View status\n/retry_all - Unstick downloads")
+    await message.reply("👋 Controller is Online!\n\n/list - Latest releases\n/queue - View status\n/retry_all - Retry failed items\n/clear_queue - Delete pending items")
 
 @app.on_message(filters.command("list"))
 async def list_releases(client, message):
@@ -164,23 +155,24 @@ async def list_releases(client, message):
 async def queue_status(client, message):
     if not await is_admin(message): return
     try:
-        query = {"status": {"$in": ["pending", "failed_dl"]}}
-        cursor = col_queue.find(query).sort("found_at", 1)
+        # Show PENDING (Priority) first, then FAILED (Waiting manual retry)
+        pending_count = await col_queue.count_documents({"status": "pending"})
+        failed_count = await col_queue.count_documents({"status": "failed_dl"})
+        
+        cursor = col_queue.find({"status": {"$in": ["pending", "failed_dl"]}}).sort([("status", -1), ("found_at", 1)])
         items = await cursor.to_list(length=30)
         
         if not items:
             await message.reply("✅ **Queue is empty!**")
             return
 
-        text = "📋 **Anime Queue Status:**\n\n"
-        for i, item in enumerate(items, 1):
-            status_icon = "⏳" if item['status'] == "pending" else "⚠️ Retry"
-            retries = item.get('retry_count', 0)
-            retry_text = f"(Try {retries})" if retries > 0 else ""
-            
-            text += f"**{i}.** {item['title']} - Ep {item['ep']} `{status_icon} {retry_text}`\n"
+        text = f"📋 **Queue Status**\n⏳ Pending: `{pending_count}` | ⚠️ Failed: `{failed_count}`\n\n"
         
-        total = await col_queue.count_documents(query)
+        for i, item in enumerate(items, 1):
+            status_icon = "⏳" if item['status'] == "pending" else "⚠️ Failed"
+            text += f"**{i}.** {item['title']} - Ep {item['ep']} `{status_icon}`\n"
+        
+        total = pending_count + failed_count
         if total > 30: text += f"\n...and {total - 30} more."
 
         await message.reply(text)
@@ -191,11 +183,21 @@ async def queue_status(client, message):
 async def retry_stuck(client, message):
     if not await is_admin(message): return
     try:
+        # Resets FAILED items to PENDING so they get picked up
         r = await col_queue.update_many(
-            {"status": {"$in": ["downloading", "failed_dl"]}}, 
+            {"status": "failed_dl"}, 
             {"$set": {"status": "pending"}}
         )
-        await message.reply(f"🔄 Reset {r.modified_count} items to Pending.")
+        await message.reply(f"🔄 Queued {r.modified_count} failed items for retry.")
+    except: pass
+
+@app.on_message(filters.command("clear_queue"))
+async def clear_queue(client, message):
+    if not await is_admin(message): return
+    try:
+        # Deletes ALL pending or failed items
+        r = await col_queue.delete_many({"status": {"$in": ["pending", "failed_dl"]}})
+        await message.reply(f"🗑️ Deleted {r.deleted_count} items from queue.")
     except: pass
 
 @app.on_message(filters.command("restart"))
@@ -214,6 +216,7 @@ async def task_poller():
             if releases:
                 for item in releases:
                     session = item["session"]
+                    # If not exists in DB, add it
                     if not await col_queue.find_one({"_id": session}):
                         entry = {
                             "_id": session,
@@ -221,8 +224,7 @@ async def task_poller():
                             "ep": item["ep"],
                             "time": item["time"],
                             "found_at": datetime.utcnow(),
-                            "status": "pending",
-                            "retry_count": 0
+                            "status": "pending" # New items are always PENDING
                         }
                         await col_queue.insert_one(entry)
                         logger.info(f"🆕 Queued: {item['title']} - Ep {item['ep']}")
@@ -233,7 +235,9 @@ async def task_poller():
 async def task_downloader():
     logger.info("⬇️ Downloader Worker Started.")
     while True:
-        item = await col_queue.find_one({"status": {"$in": ["pending", "failed_dl"]}}, sort=[("found_at", 1)])
+        # 1. PRIORITY: Pick "pending" items (Fresh releases or manually retried)
+        # We ignore "failed_dl" items until user types /retry_all
+        item = await col_queue.find_one({"status": "pending"}, sort=[("found_at", 1)])
         
         if not item:
             await asyncio.sleep(10)
@@ -241,19 +245,13 @@ async def task_downloader():
             
         title = item["title"]
         ep = item["ep"]
-        retries = item.get("retry_count", 0)
-
-        if retries >= 3:
-            logger.warning(f"💀 Skipping {title} (Too many failures)")
-            await col_queue.update_one({"_id": item["_id"]}, {"$set": {"status": "dead"}})
-            continue
         
         try:
             await col_queue.update_one({"_id": item["_id"]}, {"$set": {"status": "downloading"}})
             
             safe_title = normalize_for_cmd(title)
             
-            logger.info(f"▶️ [START] Processing: {safe_title} Ep {ep} (Try {retries+1})")
+            logger.info(f"▶️ [START] Processing: {safe_title} Ep {ep}")
             start_time = datetime.utcnow()
             
             dl_cmd = f'/anime {safe_title} -e {ep} -r all'
@@ -264,26 +262,20 @@ async def task_downloader():
             if result == "success":
                 logger.info(f"✅ [FINISH] {title} completed.")
                 await col_queue.update_one({"_id": item["_id"]}, {"$set": {"status": "downloaded"}})
+                
                 logger.info("❄️ Success. Cooling down for 30 minutes...")
                 await app.send_message(TARGET_GROUP, f"💤 Success! Cooling down 30m after **{safe_title}**...")
                 await asyncio.sleep(1800) 
 
-            elif result == "failed":
-                logger.warning(f"❌ [FAILED] {title} failed or partial.")
-                await col_queue.update_one(
-                    {"_id": item["_id"]}, 
-                    {"$set": {"status": "pending"}, "$inc": {"retry_count": 1}}
-                )
-                logger.info("❄️ Failure detected. Resting 5 mins before retry...")
-                await asyncio.sleep(300)
-
             else: 
-                logger.warning(f"❌ [TIMEOUT] {title} timed out.")
-                await col_queue.update_one(
-                    {"_id": item["_id"]}, 
-                    {"$set": {"status": "pending"}, "$inc": {"retry_count": 1}}
-                )
-                await asyncio.sleep(300)
+                # FAILED or TIMEOUT
+                logger.warning(f"❌ [FAILED] {title}")
+                # Mark as 'failed_dl' and DO NOT RETRY automatically.
+                # User must use /retry_all to try again.
+                await col_queue.update_one({"_id": item["_id"]}, {"$set": {"status": "failed_dl"}})
+                
+                # Short cool down on failure to protect server
+                await asyncio.sleep(120)
 
         except Exception as e:
             logger.error(f"Downloader Error: {e}")
