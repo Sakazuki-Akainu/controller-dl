@@ -9,7 +9,7 @@ logger = logging.getLogger("PaheList")
 
 class PaheEngine:
     def __init__(self):
-        self.base_url = "https://animepahe.si"
+        self.base_url = "https://animepahe.com"
         self.api_url = f"{self.base_url}/api"
         self.session = requests.Session()
         self.headers = {
