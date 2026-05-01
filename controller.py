@@ -309,7 +309,7 @@ async def task_poller():
                     logger.info(f"🆕 Queued: {item['title']} - Ep {item['ep']}")
         except Exception as e:
             logger.error(f"Polling Error: {e}")
-        await asyncio.sleep(30)  # TEST: change back to 600 in production
+        await asyncio.sleep(600)  # TEST: change back to 600 in production
 
 async def task_downloader():
     logger.info("⬇️ Downloader Worker Started.")
