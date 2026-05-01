@@ -1,6 +1,0 @@
-pyrogram
-tgcrypto
-motor
-aiohttp
-dnspython
-requests
